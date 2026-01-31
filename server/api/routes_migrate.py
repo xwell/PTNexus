@@ -4391,23 +4391,56 @@ def refresh_bdinfo(seed_id):
         db_manager = migrate_bp.db_manager
         torrent_name = None
 
-        if "_" in seed_id:
+        # seed_id 统一使用复合格式：hash_torrentId_siteName
+        if "_" not in seed_id:
+            return jsonify({"error": f"无效的种子ID格式: {seed_id}"}), 400
+
+        try:
+            conn = db_manager._get_connection()
+            cursor = db_manager._get_cursor(conn)
+
             parts = seed_id.split("_")
             if len(parts) >= 3:
-                hash_value = "_".join(parts[:-2])
-        else:
-            try:
-                conn = db_manager._get_connection()
-                cursor = db_manager._get_cursor(conn)
+                site_name_val = parts[-1]
+                torrent_id_val = parts[-2]
+                hash_val = "_".join(parts[:-2])
+
+                if db_manager.db_type == "sqlite":
+                    cursor.execute(
+                        "SELECT name FROM seed_parameters WHERE hash = ? AND torrent_id = ? AND site_name = ?",
+                        (hash_val, torrent_id_val, site_name_val),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT name FROM seed_parameters WHERE hash = %s AND torrent_id = %s AND site_name = %s",
+                        (hash_val, torrent_id_val, site_name_val),
+                    )
+            else:
+                # 兜底：用拼接字段匹配（理论上不会走到这里）
                 ph = db_manager.get_placeholder()
-                cursor.execute(f"SELECT name FROM seed_parameters WHERE id = {ph}", (seed_id,))
-                row = cursor.fetchone()
+                if db_manager.db_type == "sqlite":
+                    cursor.execute(
+                        f"SELECT name FROM seed_parameters WHERE hash || '_' || torrent_id || '_' || site_name = {ph}",
+                        (seed_id,),
+                    )
+                else:
+                    cursor.execute(
+                        f"SELECT name FROM seed_parameters WHERE CONCAT(hash, '_', torrent_id, '_', site_name) = {ph}",
+                        (seed_id,),
+                    )
+
+            row = cursor.fetchone()
+            if row:
+                torrent_name = row["name"] if isinstance(row, dict) else row[0]
+
+        except Exception as e:
+            logging.warning(f"通过复合seed_id查询name失败: {e}")
+        finally:
+            try:
                 cursor.close()
                 conn.close()
-                if row:
-                    torrent_name = row["name"] if isinstance(row, dict) else row[0]
-            except Exception as e:
-                logging.warning(f"通过id查询name失败: {e}")
+            except Exception:
+                pass
 
         torrent_info = get_current_torrent_info(db_manager, torrent_name)
         if not torrent_info or not torrent_info.get("save_path"):

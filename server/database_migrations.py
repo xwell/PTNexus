@@ -393,7 +393,6 @@ class DatabaseMigrationManager:
                     },
                     'seed_parameters': {
                         'columns': {
-                            'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
                             'hash': 'TEXT NOT NULL',
                             'torrent_id': 'TEXT NOT NULL',
                             'site_name': 'TEXT NOT NULL',
@@ -428,8 +427,7 @@ class DatabaseMigrationManager:
                             'created_at': 'TEXT NOT NULL',
                             'updated_at': 'TEXT NOT NULL'
                         },
-                        'primary_key': ['id'],
-                        'unique_key': ['hash', 'torrent_id', 'site_name']
+                        'primary_key': ['hash', 'torrent_id', 'site_name']
                     },
                     'batch_enhance_records': {
                         'columns': {
@@ -494,28 +492,32 @@ class DatabaseMigrationManager:
             self._migrate_remove_seed_parameters_is_deleted(conn, cursor)
 
             # 6. 执行BDInfo字段迁移
-            logging.info("迁移阶段: 6/10 BDInfo 字段迁移")
+            logging.info("迁移阶段: 6/12 删除 seed_parameters.id")
+            self._migrate_remove_seed_parameters_id(conn, cursor)
+
+            # 7. 执行BDInfo字段迁移
+            logging.info("迁移阶段: 7/12 BDInfo 字段迁移")
             self.migrate_bdinfo_fields(conn, cursor)
 
-            # 7. 执行MySQL字符集统一迁移
+            # 8. 执行MySQL字符集统一迁移
             if self.db_type == "mysql":
-                logging.info("迁移阶段: 7/10 MySQL 字符集统一")
+                logging.info("迁移阶段: 8/12 MySQL 字符集统一")
                 self._migrate_mysql_collation_unification(conn, cursor)
 
-            # 8. 执行完整的Schema完整性检查
-            logging.info("迁移阶段: 8/10 Schema 完整性检查")
+            # 9. 执行完整的Schema完整性检查
+            logging.info("迁移阶段: 9/12 Schema 完整性检查")
             self._ensure_schema_integrity(conn, cursor)
 
-            # 9. 执行复合主键迁移
-            logging.info("迁移阶段: 9/10 复合主键迁移")
+            # 10. 执行复合主键迁移
+            logging.info("迁移阶段: 10/12 复合主键迁移")
             self._migrate_composite_primary_key(conn, cursor)
 
-            # 10. 执行片源平台格式修复迁移
-            logging.info("迁移阶段: 10/11 片源平台格式修复")
+            # 11. 执行片源平台格式修复迁移
+            logging.info("迁移阶段: 11/12 片源平台格式修复")
             self._migrate_source_platform_format(conn, cursor)
 
-            # 11. 执行添加tmdb_link列迁移
-            logging.info("迁移阶段: 11/11 添加 tmdb_link 列")
+            # 12. 执行添加tmdb_link列迁移
+            logging.info("迁移阶段: 12/12 添加 tmdb_link 列")
             self._migrate_add_tmdb_link_column(conn, cursor)
 
             conn.commit()
@@ -1141,6 +1143,131 @@ class DatabaseMigrationManager:
 
         except Exception as e:
             logging.warning(f"迁移删除seed_parameters.is_deleted列时出错: {e}")
+
+    def _migrate_remove_seed_parameters_id(self, conn, cursor):
+        """迁移：删除 seed_parameters 表中的 id 列（如存在）。
+
+        说明：
+        - 当前系统的 seed_parameters 以 (hash, torrent_id, site_name) 作为复合主键/唯一键即可。
+        - 旧版本（尤其是 SQLite）可能引入自增 id，既不被业务使用，也会导致三库结构不一致。
+        """
+        try:
+            if not self._table_exists(cursor, "seed_parameters"):
+                return
+
+            if not self._column_exists(cursor, "seed_parameters", "id"):
+                return
+
+            logging.info("检测到 seed_parameters.id 存在，准备移除...")
+
+            if self.db_type == "sqlite":
+                # SQLite 无法安全地修改主键/删除自增列，使用重建表方式统一到复合主键结构
+                self._recreate_sqlite_seed_parameters_table(cursor)
+                logging.info("✓ 已移除 seed_parameters.id (SQLite)")
+                return
+
+            # MySQL/PostgreSQL：仅在 id 不属于主键时直接删除；否则改用重建表以降低风险
+            if self.db_type == "mysql":
+                cursor.execute("SHOW INDEX FROM seed_parameters WHERE Key_name = 'PRIMARY'")
+                pk_cols = [row["Column_name"] if isinstance(row, dict) else row[4] for row in cursor.fetchall()]
+                if pk_cols and "id" in pk_cols:
+                    self._recreate_seed_parameters_table_without_id_mysql(cursor)
+                    logging.info("✓ 已移除 seed_parameters.id 并统一为复合主键 (MySQL)")
+                else:
+                    cursor.execute("ALTER TABLE seed_parameters DROP COLUMN id")
+                    logging.info("✓ 已移除 seed_parameters.id (MySQL)")
+                return
+
+            if self.db_type == "postgresql":
+                cursor.execute("""
+                    SELECT a.attname
+                    FROM pg_index i
+                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                    WHERE i.indrelid = 'seed_parameters'::regclass AND i.indisprimary
+                """)
+                pk_cols = [row["attname"] if isinstance(row, dict) else row[0] for row in cursor.fetchall()]
+                if pk_cols and "id" in pk_cols:
+                    self._recreate_seed_parameters_table_without_id_postgresql(cursor)
+                    logging.info("✓ 已移除 seed_parameters.id 并统一为复合主键 (PostgreSQL)")
+                else:
+                    cursor.execute("ALTER TABLE seed_parameters DROP COLUMN id")
+                    logging.info("✓ 已移除 seed_parameters.id (PostgreSQL)")
+                return
+
+        except Exception as e:
+            # 这里降级为 warning：不阻断启动，但会给出明确原因
+            logging.warning(f"迁移删除 seed_parameters.id 失败: {e}")
+
+    def _recreate_seed_parameters_table_without_id_mysql(self, cursor):
+        import random
+
+        table_cfg = self.schema_configs["mysql"]["tables"]["seed_parameters"]
+        expected_columns = table_cfg["columns"]
+        pk_cols = table_cfg.get("primary_key", ["hash", "torrent_id", "site_name"])
+
+        temp_table = f"seed_parameters_temp_{int(time.time())}_{random.randint(1000, 9999)}"
+        backup_table = f"seed_parameters_backup_{int(time.time())}_{random.randint(1000, 9999)}"
+
+        cols_sql = ",\n                ".join(
+            [f"{col} {col_def}" for col, col_def in expected_columns.items()]
+        )
+        pk_sql = ", ".join(pk_cols)
+
+        cursor.execute(
+            f"""
+            CREATE TABLE {temp_table} (
+                {cols_sql},
+                PRIMARY KEY ({pk_sql})
+            ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC
+            """
+        )
+
+        current_cols = set(self._get_table_columns(cursor, "seed_parameters").keys())
+        copy_cols = [c for c in expected_columns.keys() if c in current_cols]
+        cols_list = ", ".join(copy_cols)
+
+        cursor.execute(
+            f"INSERT INTO {temp_table} ({cols_list}) SELECT {cols_list} FROM seed_parameters"
+        )
+
+        cursor.execute(f"RENAME TABLE seed_parameters TO {backup_table}, {temp_table} TO seed_parameters")
+        cursor.execute(f"DROP TABLE {backup_table}")
+
+    def _recreate_seed_parameters_table_without_id_postgresql(self, cursor):
+        import random
+
+        table_cfg = self.schema_configs["postgresql"]["tables"]["seed_parameters"]
+        expected_columns = table_cfg["columns"]
+        pk_cols = table_cfg.get("primary_key", ["hash", "torrent_id", "site_name"])
+
+        temp_table = f"seed_parameters_temp_{int(time.time())}_{random.randint(1000, 9999)}"
+        backup_table = f"seed_parameters_backup_{int(time.time())}_{random.randint(1000, 9999)}"
+
+        cols_sql = ",\n                ".join(
+            [f"{col} {col_def}" for col, col_def in expected_columns.items()]
+        )
+        pk_sql = ", ".join(pk_cols)
+
+        cursor.execute(
+            f"""
+            CREATE TABLE {temp_table} (
+                {cols_sql},
+                PRIMARY KEY ({pk_sql})
+            )
+            """
+        )
+
+        current_cols = set(self._get_table_columns(cursor, "seed_parameters").keys())
+        copy_cols = [c for c in expected_columns.keys() if c in current_cols]
+        cols_list = ", ".join(copy_cols)
+
+        cursor.execute(
+            f"INSERT INTO {temp_table} ({cols_list}) SELECT {cols_list} FROM seed_parameters"
+        )
+
+        cursor.execute(f"ALTER TABLE seed_parameters RENAME TO {backup_table}")
+        cursor.execute(f"ALTER TABLE {temp_table} RENAME TO seed_parameters")
+        cursor.execute(f"DROP TABLE {backup_table}")
 
     def _migrate_add_tmdb_link_column(self, conn, cursor):
         """迁移：添加seed_parameters表中的tmdb_link列"""
@@ -1831,10 +1958,9 @@ class DatabaseMigrationManager:
             # 1. 重命名原表
             cursor.execute("ALTER TABLE seed_parameters RENAME TO seed_parameters_old")
 
-            # 2. 创建新表结构（不含 save_path/downloader_id/is_deleted）
+            # 2. 创建新表结构（统一到复合主键；不含 save_path/downloader_id/is_deleted/id）
             cursor.execute("""
                 CREATE TABLE seed_parameters (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                     hash TEXT NOT NULL,
                     torrent_id TEXT NOT NULL,
                     site_name TEXT NOT NULL,
@@ -1844,6 +1970,7 @@ class DatabaseMigrationManager:
                     subtitle TEXT,
                     imdb_link TEXT,
                     douban_link TEXT,
+                    tmdb_link TEXT,
                     type TEXT,
                     medium TEXT,
                     video_codec TEXT,
@@ -1867,7 +1994,7 @@ class DatabaseMigrationManager:
                     bdinfo_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    UNIQUE(hash, torrent_id, site_name)
+                    PRIMARY KEY (hash, torrent_id, site_name)
                 )
             """)
 
@@ -1876,7 +2003,6 @@ class DatabaseMigrationManager:
             old_columns = [row[1] for row in cursor.fetchall()]
 
             new_columns = [
-                "id",
                 "hash",
                 "torrent_id",
                 "site_name",
@@ -1886,6 +2012,7 @@ class DatabaseMigrationManager:
                 "subtitle",
                 "imdb_link",
                 "douban_link",
+                "tmdb_link",
                 "type",
                 "medium",
                 "video_codec",
@@ -1914,8 +2041,10 @@ class DatabaseMigrationManager:
             common_columns = [col for col in new_columns if col in old_columns]
             if common_columns:
                 columns_str = ", ".join(common_columns)
+                # 使用 OR REPLACE：若旧表存在重复的复合键，尽量以“后写入”为准完成去重
                 cursor.execute(
-                    f"INSERT INTO seed_parameters ({columns_str}) SELECT {columns_str} FROM seed_parameters_old"
+                    f"INSERT OR REPLACE INTO seed_parameters ({columns_str}) "
+                    f"SELECT {columns_str} FROM seed_parameters_old"
                 )
 
             # 4. 删除旧表
