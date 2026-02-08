@@ -226,6 +226,38 @@ const formatNote = (note: string) => {
 }
 
 /**
+ * 复制文本到剪贴板（兼容非 HTTPS 环境）
+ */
+const copyToClipboard = async (text: string): Promise<boolean> => {
+  // 优先使用现代 Clipboard API（需要 HTTPS 或 localhost）
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      // 如果 Clipboard API 失败，继续尝试回退方案
+    }
+  }
+
+  // 回退方案：使用传统的 execCommand
+  try {
+    const textArea = document.createElement('textarea')
+    textArea.value = text
+    textArea.style.position = 'fixed'
+    textArea.style.left = '-9999px'
+    textArea.style.top = '-9999px'
+    document.body.appendChild(textArea)
+    textArea.focus()
+    textArea.select()
+    const success = document.execCommand('copy')
+    document.body.removeChild(textArea)
+    return success
+  } catch {
+    return false
+  }
+}
+
+/**
  * 处理 Note 区域的点击事件（事件委托）
  */
 const handleNoteClick = async (e: MouseEvent) => {
@@ -236,14 +268,14 @@ const handleNoteClick = async (e: MouseEvent) => {
   if (cmdBlock) {
     const cmd = cmdBlock.getAttribute('data-cmd')
     if (cmd) {
-      try {
-        await navigator.clipboard.writeText(cmd)
+      const success = await copyToClipboard(cmd)
+      if (success) {
         ElMessage.success({
           message: '命令已复制到剪贴板',
           duration: 2000,
         })
-      } catch (err) {
-        console.error('复制失败:', err)
+      } else {
+        console.error('复制失败')
         ElMessage.error('复制失败，请手动复制')
       }
     }
