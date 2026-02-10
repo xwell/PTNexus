@@ -16,8 +16,6 @@ FFMPEG_SHA256="01aebfcdbbcf83d512c1edc960eb62a6ce5f56df2e35fb3643582f78ace5f39f"
 MPV_ARCHIVE="mpv-0.41.0-x86_64.7z"
 MPV_URL="https://downloads.sourceforge.net/project/mpv-player-windows/release/${MPV_ARCHIVE}"
 MPV_SHA256="ef86fde0959d789d77a3ad7c3c2dca51c6999695363f493a6154f2c518634c0f"
-SEVEN_ZR_EXE_URL="https://www.7-zip.org/a/7zr.exe"
-SEVEN_ZR_EXE_SHA256="27cbe3d5804ad09e90bbcaa916da0d5c3b0be9462d0e0fb6cb54be5ed9030875"
 
 log() {
   echo "[build-win-linux] $*"
